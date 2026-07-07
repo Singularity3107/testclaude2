@@ -1,0 +1,433 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Glass Lava Lamp — WebGL2 Raymarch</title>
+<style>
+    html,body{margin:0;height:100%;overflow:hidden;background:#000;}
+    canvas{display:block;width:100vw;height:100vh;}
+</style>
+</head>
+<body>
+<canvas id="glcanvas"></canvas>
+
+<!-- ======================= SHADERS ======================= -->
+<script id="vs" type="x-shader/x-vertex">#version 300 es
+in vec2 aPos;
+out vec2 vUv;
+void main(){
+    vUv = aPos * 0.5 + 0.5;
+    gl_Position = vec4(aPos, 0.0, 1.0);
+}
+</script>
+
+<!-- ---------- PASS 1 : Raymarch scene into FBO ---------- -->
+<script id="fsScene" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+
+in vec2 vUv;
+out vec4 fragColor;
+
+uniform vec2  uRes;
+uniform float uTime;
+
+const vec3  SC = vec3(0.0, 0.6, 0.0);   // sphere center
+const float SR = 1.0;                   // sphere radius
+const float FLOORY = -0.4;              // floor level
+
+const vec3 COL_ORANGE  = vec3(1.0, 0.45, 0.08);
+const vec3 COL_MAGENTA = vec3(1.0, 0.10, 0.55);
+
+// ---- animated metaball positions (kept inside the sphere) ----
+vec3 blobA(){
+    float t = uTime;
+    return SC + vec3(0.26*sin(t*0.63), 0.46*sin(t*0.51), 0.20*cos(t*0.72));
+}
+vec3 blobB(){
+    float t = uTime;
+    return SC + vec3(0.30*cos(t*0.47+1.0), 0.46*cos(t*0.40), 0.24*sin(t*0.57));
+}
+
+// ---- ray/sphere intersection (near,far) ----
+vec2 iSphere(vec3 ro, vec3 rd, vec3 c, float r){
+    vec3 oc = ro - c;
+    float b = dot(oc, rd);
+    float cc = dot(oc, oc) - r*r;
+    float h = b*b - cc;
+    if(h < 0.0) return vec2(-1.0);
+    h = sqrt(h);
+    return vec2(-b - h, -b + h);
+}
+
+// ---- soft analytic shadow of the sphere ----
+float softShadow(vec3 p, vec3 ld){
+    vec3 oc = SC - p;
+    float t = dot(oc, ld);
+    if(t < 0.0) return 1.0;               // sphere behind light
+    vec3 closest = p + ld*t;
+    float d = length(closest - SC);
+    float pen = clamp((d - SR) / (SR*0.6), 0.0, 1.0);
+    return mix(0.25, 1.0, pen);
+}
+
+// ---- animated caustics projected on the floor ----
+vec3 caustics(vec3 p){
+    vec3 bA = blobA();
+    vec3 bB = blobB();
+    float dA = length(p.xz - bA.xz);
+    float dB = length(p.xz - bB.xz);
+
+    // focus rings that shift with time & blob height
+    float cA = smoothstep(1.6, 0.0, dA) *
+               (0.5 + 0.5*sin(dA*11.0 - uTime*2.3 + bA.y*4.0));
+    float cB = smoothstep(1.6, 0.0, dB) *
+               (0.5 + 0.5*sin(dB*13.0 - uTime*1.9 + bB.y*4.0));
+
+    // interference / cellular sparkle
+    float ripple = 0.5 + 0.5*sin(p.x*9.0 + uTime)*sin(p.z*9.0 - uTime*0.7);
+    float k = (cA + cB) * ripple;
+
+    vec3 col = COL_ORANGE*cA + COL_MAGENTA*cB;
+    return col * k * 0.9;
+}
+
+// ---- sky / environment ----
+vec3 sky(vec3 rd){
+    float t = clamp(rd.y*0.5 + 0.5, 0.0, 1.0);
+    vec3 top = vec3(0.02, 0.03, 0.06);
+    vec3 hor = vec3(0.10, 0.07, 0.12);
+    vec3 c = mix(hor, top, t);
+    // faint warm glow near sphere direction
+    c += vec3(0.05,0.02,0.04)*pow(max(0.0,dot(rd,normalize(vec3(0.0,0.3,-1.0)))),4.0);
+    return c;
+}
+
+// ---- checkered floor shading (with shadow + caustics) ----
+vec3 floorColor(vec3 p){
+    vec3 ld = normalize(vec3(0.35, 1.0, 0.25));   // key light
+    float chk = mod(floor(p.x) + floor(p.z), 2.0);
+    vec3 base = mix(vec3(0.05,0.05,0.06), vec3(0.22,0.22,0.25), chk);
+
+    // distance fade
+    float fade = exp(-0.02*length(p.xz));
+    base *= (0.35 + 0.65*fade);
+
+    float sh = softShadow(p, ld);
+    float diff = 0.6;
+    vec3 col = base * (0.25 + diff*sh);
+
+    // caustic light on floor
+    col += caustics(p);
+    return col;
+}
+
+// ---- environment as seen from any ray (floor + sky), no sphere ----
+vec3 background(vec3 ro, vec3 rd){
+    if(rd.y < -0.0001){
+        float t = (FLOORY - ro.y) / rd.y;
+        if(t > 0.0){
+            vec3 p = ro + rd*t;
+            return floorColor(p);
+        }
+    }
+    return sky(rd);
+}
+
+// ---- integrate metaball emission along a segment inside the sphere ----
+vec3 innerGlow(vec3 ro, vec3 rd, float len){
+    vec3 bA = blobA();
+    vec3 bB = blobB();
+    vec3 acc = vec3(0.0);
+    const int N = 28;
+    float dt = len / float(N);
+    for(int i=0;i<N;i++){
+        vec3 sp = ro + rd*(dt*(float(i)+0.5));
+        float dA = length(sp - bA);
+        float dB = length(sp - bB);
+        float mA = exp(-dA*dA*7.0);
+        float mB = exp(-dB*dB*7.0);
+        vec3  c  = COL_ORANGE*mA + COL_MAGENTA*mB;
+        acc += c;
+    }
+    return acc * dt * 3.2;
+}
+
+void main(){
+    vec2 uv = (gl_FragCoord.xy - 0.5*uRes) / uRes.y;
+
+    // ---- orbiting camera ----
+    float ca = uTime * 0.15;
+    vec3 ro = vec3(sin(ca)*4.0, 1.8, cos(ca)*4.0);
+    vec3 ta = vec3(0.0, 0.35, 0.0);
+    vec3 fw = normalize(ta - ro);
+    vec3 rt = normalize(cross(vec3(0.0,1.0,0.0), fw));
+    vec3 up = cross(fw, rt);
+    vec3 rd = normalize(uv.x*rt + uv.y*up + 1.5*fw);
+
+    vec3 col = sky(rd);
+    float glassMask = 0.0;
+
+    // intersect sphere & floor
+    vec2 sph = iSphere(ro, rd, SC, SR);
+    float tFloor = 1e9;
+    if(rd.y < -0.0001){
+        float tf = (FLOORY - ro.y)/rd.y;
+        if(tf > 0.0) tFloor = tf;
+    }
+
+    bool hitSphere = (sph.x > 0.0);
+    if(hitSphere && sph.x < tFloor){
+        // ===== GLASS SPHERE =====
+        vec3 pos = ro + rd*sph.x;
+        vec3 n   = normalize(pos - SC);
+
+        // Fresnel
+        float fres = pow(1.0 - max(dot(-rd, n), 0.0), 3.0);
+        fres = mix(0.05, 1.0, fres);
+
+        // Reflection
+        vec3 rRefl = reflect(rd, n);
+        vec3 reflCol = background(pos + n*0.01, rRefl);
+
+        // Refraction (double: entry then exit)
+        float eta = 1.0/1.45;
+        vec3 rd1 = refract(rd, n, eta);
+        vec3 refrCol;
+        vec3 glow = vec3(0.0);
+
+        if(length(rd1) > 0.0){
+            vec2 innerHit = iSphere(pos + rd1*0.001, rd1, SC, SR);
+            float tExit = max(innerHit.y, 0.0);
+            vec3 pExit = pos + rd1*tExit;
+            vec3 nExit = normalize(pExit - SC);
+
+            // accumulate inner fluid emission
+            glow = innerGlow(pos, rd1, tExit);
+
+            vec3 rd2 = refract(rd1, -nExit, 1.45);
+            if(length(rd2) > 0.0)
+                refrCol = background(pExit + rd2*0.001, rd2);
+            else
+                refrCol = background(pExit, reflect(rd1, -nExit)); // total internal
+        } else {
+            refrCol = reflCol;
+        }
+
+        col = mix(refrCol, reflCol, fres) + glow;
+
+        // subtle glass tint & rim
+        col *= vec3(0.95, 0.97, 1.0);
+        col += vec3(0.15,0.18,0.25) * fres;
+
+        glassMask = fres;   // stored for edge-based chromatic aberration
+    }
+    else if(tFloor < 1e8){
+        // ===== FLOOR =====
+        vec3 p = ro + rd*tFloor;
+        col = floorColor(p);
+    }
+
+    fragColor = vec4(col, glassMask);
+}
+</script>
+
+<!-- ---------- PASS 2 : Post-process to screen ---------- -->
+<script id="fsPost" type="x-shader/x-fragment">#version 300 es
+precision highp float;
+
+in vec2 vUv;
+out vec4 fragColor;
+
+uniform sampler2D uTex;
+uniform vec2 uRes;
+
+// cheap bloom from bright (warm) areas
+vec3 getBloom(vec2 uv){
+    vec3 sum = vec3(0.0);
+    float w = 0.0;
+    for(int i=0;i<24;i++){
+        float ang = float(i)*0.2618;               // 24 dirs
+        float rad = (1.0 + float(i-(i/3)*3))*0.007; // 3 radii
+        vec2 o = vec2(cos(ang), sin(ang))*rad;
+        vec3 s = texture(uTex, uv+o).rgb;
+        float b = max(0.0, dot(s, vec3(0.333)) - 0.55);
+        sum += s*b;
+        w  += 1.0;
+    }
+    return sum / w;
+}
+
+void main(){
+    vec2 uv = vUv;
+    vec2 dir = uv - 0.5;
+    float dist = length(dir);
+
+    float edge = texture(uTex, uv).a;   // glass Fresnel/edge mask
+
+    // ---- chromatic aberration, intensified at glass edges & screen edges ----
+    float ca = 0.0025 + edge*0.020 + dist*0.004;
+    vec2 off = normalize(dir + 1e-6) * ca;
+
+    float r = texture(uTex, uv + off).r;
+    float g = texture(uTex, uv       ).g;
+    float b = texture(uTex, uv - off).b;
+    vec3 col = vec3(r, g, b);
+
+    // ---- bloom / glow ----
+    col += getBloom(uv) * 1.4;
+
+    // ---- vignette ----
+    float vig = smoothstep(1.15, 0.30, dist);
+    col *= vig;
+
+    // ---- tone map + gamma ----
+    col = col / (col + vec3(1.0));       // Reinhard
+    col = pow(col, vec3(1.0/2.2));
+
+    fragColor = vec4(col, 1.0);
+}
+</script>
+
+<!-- ======================= JAVASCRIPT ======================= -->
+<script>
+"use strict";
+const canvas = document.getElementById("glcanvas");
+const gl = canvas.getContext("webgl2", {antialias:false, alpha:false});
+if(!gl){ alert("WebGL2 not supported"); }
+
+// float color buffer support
+const extCBF = gl.getExtension("EXT_color_buffer_float");
+if(!extCBF){ console.warn("EXT_color_buffer_float not available; falling back."); }
+
+// ---------- shader helpers ----------
+function compile(type, src){
+    const s = gl.createShader(type);
+    gl.shaderSource(s, src);
+    gl.compileShader(s);
+    if(!gl.getShaderParameter(s, gl.COMPILE_STATUS)){
+        console.error(gl.getShaderInfoLog(s));
+        throw new Error("Shader compile error");
+    }
+    return s;
+}
+function program(vsSrc, fsSrc){
+    const p = gl.createProgram();
+    gl.attachShader(p, compile(gl.VERTEX_SHADER, vsSrc));
+    gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fsSrc));
+    gl.bindAttribLocation(p, 0, "aPos");
+    gl.linkProgram(p);
+    if(!gl.getProgramParameter(p, gl.LINK_STATUS)){
+        console.error(gl.getProgramInfoLog(p));
+        throw new Error("Program link error");
+    }
+    return p;
+}
+
+const vsSrc     = document.getElementById("vs").textContent.trim();
+const fsScene   = document.getElementById("fsScene").textContent.trim();
+const fsPost    = document.getElementById("fsPost").textContent.trim();
+
+const progScene = program(vsSrc, fsScene);
+const progPost  = program(vsSrc, fsPost);
+
+// ---------- fullscreen triangle ----------
+const vao = gl.createVertexArray();
+gl.bindVertexArray(vao);
+const vbo = gl.createBuffer();
+gl.bindBuffer(gl.ARRAY_BUFFER, vbo);
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0);
+gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+gl.bindVertexArray(null);
+
+// ---------- FBO setup ----------
+let fbo = null, fboTex = null;
+function createFBO(w, h){
+    if(fbo)    gl.deleteFramebuffer(fbo);
+    if(fboTex) gl.deleteTexture(fboTex);
+
+    fboTex = gl.createTexture();
+    gl.bindTexture(gl.TEXTURE_2D, fboTex);
+    gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+
+    fbo = gl.createFramebuffer();
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, fboTex, 0);
+
+    const st = gl.checkFramebufferStatus(gl.FRAMEBUFFER);
+    if(st !== gl.FRAMEBUFFER_COMPLETE) console.error("FBO incomplete:", st);
+
+    // unbind to avoid feedback loops
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+    gl.bindTexture(gl.TEXTURE_2D, null);
+}
+
+// ---------- uniforms ----------
+const uScene = {
+    res:  gl.getUniformLocation(progScene, "uRes"),
+    time: gl.getUniformLocation(progScene, "uTime"),
+};
+const uPost = {
+    tex:  gl.getUniformLocation(progPost, "uTex"),
+    res:  gl.getUniformLocation(progPost, "uRes"),
+};
+
+// ---------- resize ----------
+let W = 0, H = 0;
+function resize(){
+    const dpr = Math.min(window.devicePixelRatio || 1, 2.0);
+    const w = Math.floor(window.innerWidth  * dpr);
+    const h = Math.floor(window.innerHeight * dpr);
+    if(w !== W || h !== H){
+        W = w; H = h;
+        canvas.width = W; canvas.height = H;
+        createFBO(W, H);
+    }
+}
+window.addEventListener("resize", resize);
+resize();
+
+// ---------- render loop ----------
+const start = performance.now();
+function frame(){
+    const t = (performance.now() - start) * 0.001;
+
+    // ===== PASS 1 : scene -> FBO =====
+    gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
+    gl.viewport(0, 0, W, H);
+    gl.useProgram(progScene);
+    gl.uniform2f(uScene.res, W, H);
+    gl.uniform1f(uScene.time, t);
+    gl.bindVertexArray(vao);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.bindVertexArray(null);
+
+    // explicitly unbind FBO to prevent feedback loop
+    gl.bindFramebuffer(gl.FRAMEBUFFER, null);
+
+    // ===== PASS 2 : FBO texture -> screen =====
+    gl.viewport(0, 0, W, H);
+    gl.useProgram(progPost);
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, fboTex);
+    gl.uniform1i(uPost.tex, 0);
+    gl.uniform2f(uPost.res, W, H);
+    gl.bindVertexArray(vao);
+    gl.drawArrays(gl.TRIANGLES, 0, 3);
+    gl.bindVertexArray(null);
+
+    // clean state
+    gl.bindTexture(gl.TEXTURE_2D, null);
+    gl.activeTexture(gl.TEXTURE0);
+
+    requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
