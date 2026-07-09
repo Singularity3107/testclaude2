@@ -3,335 +3,318 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Rainy Window</title>
+<title>Rainy Window Night</title>
 <style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
   html, body {
-    margin: 0;
+    width: 100%;
     height: 100%;
     overflow: hidden;
     background: #05070d;
+    cursor: crosshair;
   }
   #scene {
     position: fixed;
     inset: 0;
-    cursor: crosshair;
   }
-  /* Blurred, out-of-focus night scene behind the wet glass */
-  #bg {
+  /* Blurred lights behind the window */
+  #lights {
     position: absolute;
-    inset: -4%;
-    width: 108%;
-    height: 108%;
-    filter: blur(3px) brightness(0.95);
+    inset: 0;
+    overflow: hidden;
+    filter: blur(14px) brightness(1.05);
   }
-  /* The glass condensation + droplet layer */
-  #glass {
+  .bokeh {
+    position: absolute;
+    border-radius: 50%;
+    mix-blend-mode: screen;
+    animation: sway 12s ease-in-out infinite alternate;
+  }
+  @keyframes sway {
+    from { transform: translate(0,0); }
+    to   { transform: translate(14px, 10px); }
+  }
+  /* City silhouette / dark gradient overlay */
+  #vignette {
+    position: absolute;
+    inset: 0;
+    background:
+      radial-gradient(ellipse at 50% 40%, rgba(0,0,0,0) 30%, rgba(3,5,10,0.55) 100%),
+      linear-gradient(to bottom, rgba(5,8,16,0.35), rgba(2,3,8,0.6));
+    pointer-events: none;
+  }
+  /* Fog / condensation tint */
+  #fog {
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(to bottom, rgba(120,140,170,0.06), rgba(80,100,140,0.10));
+    pointer-events: none;
+  }
+  canvas {
     position: absolute;
     inset: 0;
     width: 100%;
     height: 100%;
   }
-  .hint {
+  #hint {
     position: absolute;
-    left: 50%;
-    bottom: 22px;
-    transform: translateX(-50%);
-    color: rgba(220,230,245,0.35);
-    font: 13px/1.4 system-ui, sans-serif;
-    letter-spacing: .04em;
+    bottom: 20px;
+    left: 0; right: 0;
+    text-align: center;
+    color: rgba(200,215,235,0.5);
+    font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    font-size: 13px;
+    letter-spacing: 1px;
     pointer-events: none;
-    user-select: none;
-    animation: fade 6s ease forwards;
+    text-shadow: 0 1px 3px rgba(0,0,0,0.6);
+    animation: fade 6s ease-in forwards;
   }
-  @keyframes fade { 0%,70%{opacity:1} 100%{opacity:0} }
+  @keyframes fade { 0%,60% { opacity: 1; } 100% { opacity: 0; } }
 </style>
 </head>
 <body>
 <div id="scene">
-  <canvas id="bg"></canvas>
+  <div id="lights"></div>
+  <div id="fog"></div>
+  <div id="vignette"></div>
   <canvas id="glass"></canvas>
-  <div class="hint">click &amp; drag on the glass</div>
 </div>
+<div id="hint">click &amp; drag to spray water on the glass</div>
 <script>
 (() => {
   "use strict";
 
-  const bg = document.getElementById('bg');
-  const bctx = bg.getContext('2d');
-  const glass = document.getElementById('glass');
-  const gctx = glass.getContext('2d');
+  // ---------- Background bokeh lights ----------
+  const lightsEl = document.getElementById('lights');
+  const palette = [
+    'rgba(255,180,90,',   // warm amber
+    'rgba(120,170,255,',  // cool blue
+    'rgba(255,120,130,',  // red-pink
+    'rgba(140,255,200,',  // teal
+    'rgba(255,225,150,',  // soft yellow
+    'rgba(200,150,255,'   // violet
+  ];
+  function buildLights() {
+    lightsEl.innerHTML = '';
+    const n = 34;
+    for (let i = 0; i < n; i++) {
+      const d = document.createElement('div');
+      d.className = 'bokeh';
+      const size = 18 + Math.random() * 90;
+      const col = palette[(Math.random() * palette.length) | 0];
+      const alpha = 0.25 + Math.random() * 0.5;
+      d.style.width = size + 'px';
+      d.style.height = size + 'px';
+      d.style.left = (Math.random() * 100) + '%';
+      d.style.top = (Math.random() * 100) + '%';
+      d.style.background = 'radial-gradient(circle, ' + col + alpha + ') 0%, ' + col + '0) 70%)';
+      d.style.animationDuration = (8 + Math.random() * 10) + 's';
+      d.style.animationDelay = (-Math.random() * 10) + 's';
+      lightsEl.appendChild(d);
+    }
+  }
+  buildLights();
 
-  let W = 0, H = 0, DPR = Math.min(window.devicePixelRatio || 1, 2);
-  const PI2 = Math.PI * 2;
-  const rand = (a, b) => a + Math.random() * (b - a);
+  // ---------- Glass droplet canvas ----------
+  const canvas = document.getElementById('glass');
+  const ctx = canvas.getContext('2d');
+  let W, H, DPR;
 
-  // ---------- Sprites (soft hole + glossy bead) ----------
-  function makeSprite(draw) {
-    const s = document.createElement('canvas');
-    s.width = s.height = 64;
-    draw(s.getContext('2d'));
-    return s;
+  function resize() {
+    DPR = Math.min(window.devicePixelRatio || 1, 2);
+    W = window.innerWidth;
+    H = window.innerHeight;
+    canvas.width = W * DPR;
+    canvas.height = H * DPR;
+    ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  }
+  resize();
+  window.addEventListener('resize', () => { resize(); buildLights(); });
+
+  // A droplet on the glass
+  class Drop {
+    constructor(x, y, r) {
+      this.x = x;
+      this.y = y;
+      this.r = r;
+      this.vy = 0;
+      this.momentum = 0;
+      this.life = 1;
+      // small tremble
+      this.wobble = Math.random() * Math.PI * 2;
+    }
   }
 
-  // Soft erase-hole: clears the fog, revealing the scene beneath.
-  const holeSprite = makeSprite(ctx => {
-    const g = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
-    g.addColorStop(0, 'rgba(0,0,0,1)');
-    g.addColorStop(0.65, 'rgba(0,0,0,0.95)');
-    g.addColorStop(1, 'rgba(0,0,0,0)');
+  let drops = [];
+  const MAX_DROPS = 900;
+
+  // Add a static cling droplet
+  function addDrop(x, y, r) {
+    if (drops.length >= MAX_DROPS) return;
+    drops.push(new Drop(x, y, r));
+  }
+
+  // seed some ambient droplets
+  function seed() {
+    for (let i = 0; i < 160; i++) {
+      addDrop(Math.random() * W, Math.random() * H, 1.2 + Math.random() * 3.5);
+    }
+  }
+  seed();
+
+  // Draw a single droplet with lens-like shading
+  function drawDrop(d) {
+    const r = d.r;
+    if (r < 0.6) return;
+    ctx.save();
+    ctx.translate(d.x, d.y);
+
+    // main body — semi transparent lens that darkens edges + bright highlight
+    const g = ctx.createRadialGradient(-r*0.3, -r*0.3, r*0.1, 0, 0, r);
+    g.addColorStop(0, 'rgba(230,240,255,0.28)');
+    g.addColorStop(0.5, 'rgba(160,180,210,0.14)');
+    g.addColorStop(0.85, 'rgba(40,55,80,0.30)');
+    g.addColorStop(1, 'rgba(20,30,50,0.05)');
+    ctx.beginPath();
+    ctx.arc(0, 0, r, 0, Math.PI * 2);
     ctx.fillStyle = g;
-    ctx.fillRect(0, 0, 64, 64);
-  });
-
-  // Glossy bead overlay: subtle rim shadow + bright specular highlight.
-  const beadSprite = makeSprite(ctx => {
-    const ring = ctx.createRadialGradient(32, 32, 0, 32, 32, 32);
-    ring.addColorStop(0, 'rgba(0,0,0,0)');
-    ring.addColorStop(0.78, 'rgba(0,0,0,0)');
-    ring.addColorStop(0.93, 'rgba(10,15,30,0.28)');
-    ring.addColorStop(1, 'rgba(0,0,0,0)');
-    ctx.fillStyle = ring;
-    ctx.fillRect(0, 0, 64, 64);
-    // specular highlight (top-left)
-    const hi = ctx.createRadialGradient(23, 22, 0, 23, 22, 12);
-    hi.addColorStop(0, 'rgba(255,255,255,0.85)');
-    hi.addColorStop(1, 'rgba(255,255,255,0)');
-    ctx.fillStyle = hi;
-    ctx.beginPath();
-    ctx.arc(23, 22, 12, 0, PI2);
     ctx.fill();
-    // small lower glow
-    const lo = ctx.createRadialGradient(40, 42, 0, 40, 42, 10);
-    lo.addColorStop(0, 'rgba(200,215,240,0.20)');
-    lo.addColorStop(1, 'rgba(200,215,240,0)');
-    ctx.fillStyle = lo;
+
+    // bright specular highlight (top-left)
     ctx.beginPath();
-    ctx.arc(40, 42, 10, 0, PI2);
+    ctx.arc(-r*0.35, -r*0.4, r*0.28, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(255,255,255,0.55)';
     ctx.fill();
-  });
 
-  // ---------- Background: gradient night + soft bokeh ----------
-  function drawBackground() {
-    const w = bg.width, h = bg.height;
-    // base vertical gradient
-    const grad = bctx.createLinearGradient(0, 0, 0, h);
-    grad.addColorStop(0, '#0a0f1e');
-    grad.addColorStop(0.5, '#111a2e');
-    grad.addColorStop(1, '#1a2438');
-    bctx.fillStyle = grad;
-    bctx.fillRect(0, 0, w, h);
+    // subtle bottom refraction glow
+    ctx.beginPath();
+    ctx.arc(r*0.15, r*0.35, r*0.5, 0, Math.PI*2);
+    ctx.fillStyle = 'rgba(200,220,255,0.10)';
+    ctx.fill();
 
-    const palette = [
-      [255, 190, 120], [255, 150, 90], [120, 200, 255],
-      [150, 130, 255], [255, 230, 170], [90, 220, 210]
-    ];
-
-    bctx.globalCompositeOperation = 'lighter';
-    const count = 26;
-    for (let i = 0; i < count; i++) {
-      const c = palette[(Math.random() * palette.length) | 0];
-      const r = rand(30, 150) * DPR;
-      const x = Math.random() * w;
-      const y = rand(0.05, 0.95) * h;
-      const a = rand(0.10, 0.35);
-      const g = bctx.createRadialGradient(x, y, 0, x, y, r);
-      g.addColorStop(0, `rgba(${c[0]},${c[1]},${c[2]},${a})`);
-      g.addColorStop(0.5, `rgba(${c[0]},${c[1]},${c[2]},${a * 0.4})`);
-      g.addColorStop(1, `rgba(${c[0]},${c[1]},${c[2]},0)`);
-      bctx.fillStyle = g;
-      bctx.beginPath();
-      bctx.arc(x, y, r, 0, PI2);
-      bctx.fill();
-    }
-    bctx.globalCompositeOperation = 'source-over';
-
-    // gentle vignette
-    const vig = bctx.createRadialGradient(w / 2, h / 2, Math.min(w, h) * 0.2,
-                                          w / 2, h / 2, Math.max(w, h) * 0.75);
-    vig.addColorStop(0, 'rgba(0,0,0,0)');
-    vig.addColorStop(1, 'rgba(0,0,0,0.55)');
-    bctx.fillStyle = vig;
-    bctx.fillRect(0, 0, w, h);
+    ctx.restore();
   }
 
-  // ---------- Droplets ----------
-  let statics = [];   // condensation beads that sit on the glass
-  let dynamics = [];  // sliding drops with trails
-
-  function initStatics() {
-    statics.length = 0;
-    const density = (W * H) / (14000);
-    const n = Math.min(520, Math.max(120, density | 0));
-    for (let i = 0; i < n; i++) {
-      statics.push({ x: Math.random() * W, y: Math.random() * H, r: rand(1, 3.2) });
-    }
+  // Trail streak overlay canvas for streaking effect
+  const trail = document.createElement('canvas');
+  const tctx = trail.getContext('2d');
+  function resizeTrail() {
+    trail.width = W * DPR;
+    trail.height = H * DPR;
+    tctx.setTransform(DPR, 0, 0, DPR, 0, 0);
   }
+  resizeTrail();
+  window.addEventListener('resize', resizeTrail);
 
-  function newDynamic(x, y, r) {
-    return { x, y, r, vy: 0, wob: rand(0, PI2), trail: [], seed: 0 };
-  }
+  let lastTime = performance.now();
 
-  function addWater(x, y, big) {
-    // main sliding drop
-    dynamics.push(newDynamic(x, y, big ? rand(7, 13) : rand(4, 8)));
-    // scattered small splash beads
-    const n = big ? 7 : 4;
-    for (let i = 0; i < n; i++) {
-      statics.push({
-        x: x + rand(-18, 18),
-        y: y + rand(-18, 18),
-        r: rand(1, 3.5)
-      });
-    }
-    if (statics.length > 900) statics.splice(0, statics.length - 900);
-    if (dynamics.length > 130) dynamics.splice(0, dynamics.length - 130);
-  }
+  function update(dt) {
+    // Fade trail slowly (leaves faint wet path)
+    tctx.save();
+    tctx.setTransform(DPR,0,0,DPR,0,0);
+    tctx.globalCompositeOperation = 'source-over';
+    tctx.fillStyle = 'rgba(0,0,0,0.03)';
+    tctx.fillRect(0, 0, W, H);
+    tctx.restore();
 
-  function updateDynamics() {
-    for (let i = dynamics.length - 1; i >= 0; i--) {
-      const d = dynamics[i];
-      // heavier drops fall faster
-      const target = 0.35 + d.r * 0.16;
-      d.vy += (target - d.vy) * 0.05;
-      d.y += d.vy;
-      d.wob += 0.05;
-      d.x += Math.sin(d.wob) * 0.35;
+    for (let i = drops.length - 1; i >= 0; i--) {
+      const d = drops[i];
 
-      // lay down a fading trail point
-      if (d.vy > 0.4) {
-        d.trail.push({ x: d.x, y: d.y, r: d.r * 0.42 });
-      }
-      // age trail
-      for (let t = d.trail.length - 1; t >= 0; t--) {
-        d.trail[t].r *= 0.965;
-        if (d.trail[t].r < 0.6) d.trail.splice(t, 1);
+      // Larger drops build gravity momentum and start sliding
+      const gravityThreshold = 4.2 + Math.random()*0.3;
+      if (d.r > gravityThreshold) {
+        d.momentum += (d.r - gravityThreshold) * 0.02;
+        // occasional stick
+        if (Math.random() < 0.03) d.momentum *= 0.6;
+        d.vy = d.momentum;
+      } else {
+        d.vy *= 0.9;
       }
 
-      // absorb nearby static beads (visual merge) and grow slightly
-      const reach = d.r + 6;
-      for (let s = statics.length - 1; s >= 0; s--) {
-        const st = statics[s];
-        const dx = st.x - d.x, dy = st.y - d.y;
-        if (dx * dx + dy * dy < reach * reach) {
-          d.r = Math.min(15, Math.sqrt(d.r * d.r + st.r * st.r * 0.7));
-          statics.splice(s, 1);
-        }
+      if (d.vy > 0.05) {
+        const prevY = d.y;
+        d.y += d.vy * dt * 60 / 16;
+        d.x += Math.sin(d.wobble += 0.1) * 0.3;
+
+        // draw wet trail on the trail canvas
+        tctx.beginPath();
+        tctx.strokeStyle = 'rgba(180,200,230,0.10)';
+        tctx.lineWidth = Math.max(1, d.r * 0.5);
+        tctx.lineCap = 'round';
+        tctx.moveTo(d.x, prevY);
+        tctx.lineTo(d.x, d.y);
+        tctx.stroke();
+
+        // sliding drops shrink slightly (leaving residue) and can absorb others
+        d.r -= 0.008 * (d.vy);
       }
 
-      // occasionally leave a residual bead behind (breakup)
-      if (Math.random() < 0.02 && d.r > 5) {
-        statics.push({ x: d.x + rand(-2, 2), y: d.y - d.r, r: rand(1, 2.5) });
-      }
+      // Merge nearby drops (cheap check against a few neighbors)
+      // (skipped heavy N^2; rely on spray density instead)
 
-      if (d.y - d.r > H) dynamics.splice(i, 1);
+      // remove off-screen or tiny
+      if (d.y - d.r > H || d.r < 0.5) {
+        drops.splice(i, 1);
+      }
     }
-  }
 
-  // ---------- Render loop ----------
-  const fogColor = 'rgba(150,166,196,0.30)';
-
-  function erase(x, y, r) {
-    gctx.drawImage(holeSprite, x - r, y - r, r * 2, r * 2);
-  }
-  function bead(x, y, r) {
-    gctx.drawImage(beadSprite, x - r, y - r, r * 2, r * 2);
+    // Ambient random new small drops
+    if (drops.length < MAX_DROPS && Math.random() < 0.5) {
+      addDrop(Math.random() * W, Math.random() * H * 0.6, 0.8 + Math.random() * 2);
+    }
   }
 
   function render() {
-    // fresh condensation fog every frame
-    gctx.globalCompositeOperation = 'source-over';
-    gctx.clearRect(0, 0, glass.width, glass.height);
-    gctx.fillStyle = fogColor;
-    gctx.fillRect(0, 0, glass.width, glass.height);
-
-    // punch clear holes where water sits (reveals scene beneath)
-    gctx.globalCompositeOperation = 'destination-out';
-    for (let i = 0; i < statics.length; i++) {
-      const s = statics[i];
-      erase(s.x, s.y, s.r + 1);
-    }
-    for (let i = 0; i < dynamics.length; i++) {
-      const d = dynamics[i];
-      const tr = d.trail;
-      for (let t = 0; t < tr.length; t++) erase(tr[t].x, tr[t].y, tr[t].r + 0.5);
-      erase(d.x, d.y, d.r + 1);
-    }
-
-    // glossy bead shading on top
-    gctx.globalCompositeOperation = 'source-over';
-    for (let i = 0; i < statics.length; i++) {
-      const s = statics[i];
-      if (s.r > 1.6) bead(s.x, s.y, s.r + 1.5);
-    }
-    for (let i = 0; i < dynamics.length; i++) {
-      const d = dynamics[i];
-      bead(d.x, d.y, d.r + 2);
-    }
+    ctx.clearRect(0, 0, W, H);
+    // draw trail (streaks) beneath
+    ctx.drawImage(trail, 0, 0, W, H);
+    // draw drops
+    for (let i = 0; i < drops.length; i++) drawDrop(drops[i]);
   }
 
-  function tick() {
-    // ambient rain keeps the scene alive
-    if (Math.random() < 0.06) {
-      addWater(Math.random() * W, rand(-10, 40), Math.random() < 0.3);
-    }
-    updateDynamics();
+  function loop(now) {
+    const dt = Math.min(50, now - lastTime);
+    lastTime = now;
+    update(dt);
     render();
-    requestAnimationFrame(tick);
+    requestAnimationFrame(loop);
   }
+  requestAnimationFrame(loop);
 
-  // ---------- Interaction ----------
-  let dragging = false, lastX = 0, lastY = 0;
+  // ---------- Spray interaction ----------
+  let spraying = false;
 
-  function pointer(e) {
-    const t = e.touches ? e.touches[0] : e;
-    return { x: t.clientX, y: t.clientY };
-  }
-  function down(e) {
-    dragging = true;
-    const p = pointer(e);
-    lastX = p.x; lastY = p.y;
-    addWater(p.x, p.y, true);
-  }
-  function move(e) {
-    if (!dragging) return;
-    const p = pointer(e);
-    const dx = p.x - lastX, dy = p.y - lastY;
-    if (dx * dx + dy * dy > 100) {
-      addWater(p.x, p.y, Math.random() < 0.5);
-      lastX = p.x; lastY = p.y;
+  function spray(x, y) {
+    const count = 10 + (Math.random() * 8 | 0);
+    for (let i = 0; i < count; i++) {
+      const ang = Math.random() * Math.PI * 2;
+      const dist = Math.random() * 34;
+      const px = x + Math.cos(ang) * dist;
+      const py = y + Math.sin(ang) * dist;
+      const r = 1 + Math.random() * 5.5;
+      addDrop(px, py, r);
     }
-    if (e.cancelable) e.preventDefault();
-  }
-  function up() { dragging = false; }
-
-  const scene = document.getElementById('scene');
-  scene.addEventListener('mousedown', down);
-  scene.addEventListener('mousemove', move);
-  window.addEventListener('mouseup', up);
-  scene.addEventListener('touchstart', down, { passive: false });
-  scene.addEventListener('touchmove', move, { passive: false });
-  window.addEventListener('touchend', up);
-
-  // ---------- Resize ----------
-  function resize() {
-    W = window.innerWidth;
-    H = window.innerHeight;
-    DPR = Math.min(window.devicePixelRatio || 1, 2);
-
-    bg.width = Math.round(W * DPR);
-    bg.height = Math.round(H * DPR);
-
-    glass.width = Math.round(W * DPR);
-    glass.height = Math.round(H * DPR);
-    gctx.setTransform(DPR, 0, 0, DPR, 0, 0);
-
-    drawBackground();
-    initStatics();
+    // a couple of big blobs
+    for (let i = 0; i < 2; i++) {
+      addDrop(x + (Math.random()-0.5)*20, y + (Math.random()-0.5)*20, 5 + Math.random()*4);
+    }
   }
 
-  window.addEventListener('resize', resize);
-  resize();
-  requestAnimationFrame(tick);
+  function pos(e) {
+    if (e.touches && e.touches[0]) {
+      return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+    }
+    return { x: e.clientX, y: e.clientY };
+  }
+
+  canvas.addEventListener('mousedown', e => { spraying = true; const p = pos(e); spray(p.x, p.y); });
+  window.addEventListener('mouseup', () => spraying = false);
+  window.addEventListener('mousemove', e => { if (spraying) { const p = pos(e); spray(p.x, p.y); } });
+
+  canvas.addEventListener('touchstart', e => { e.preventDefault(); spraying = true; const p = pos(e); spray(p.x, p.y); }, {passive:false});
+  window.addEventListener('touchend', () => spraying = false);
+  window.addEventListener('touchmove', e => { if (spraying) { e.preventDefault(); const p = pos(e); spray(p.x, p.y); } }, {passive:false});
+
 })();
 </script>
 </body>
